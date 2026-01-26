@@ -10,7 +10,8 @@ from typing import Optional, Dict
 import time
 import json
 import os
-
+import pytesseract
+pytesseract.pytesseract.tesseract_cmd = r"D:/Tesseract-OCR/tesseract.exe"
 # ==============================
 # LOGGING SETUP
 # ==============================
@@ -24,7 +25,7 @@ logger = logging.getLogger(__name__)
 # CONFIG
 # ==============================
 class Config:
-    MODEL_PATH = "D:/gog/AI_ocr/best.pt"
+    MODEL_PATH = "D:/gog/AI_ocr/model/best_v8.pt"
     PORT = 8000
 
     OUTPUT_JSON_DIR = "json_results"   # 🔹 โฟลเดอร์เก็บไฟล์ json
