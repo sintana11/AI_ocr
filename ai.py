@@ -4,14 +4,15 @@ import easyocr
 import cv2
 import numpy as np
 import re
-from pyzbar.pyzbar import decode
 import logging
 from typing import Optional, Dict
 import time
 import json
 import os
 import pytesseract
+
 pytesseract.pytesseract.tesseract_cmd = r"D:/Tesseract-OCR/tesseract.exe"
+
 # ==============================
 # LOGGING SETUP
 # ==============================
@@ -21,14 +22,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ==============================
-# CONFIG
-# ==============================
+
 class Config:
     MODEL_PATH = "D:/gog/AI_ocr/model/best_v8.pt"
     PORT = 8000
 
-    OUTPUT_JSON_DIR = "json_results"   # 🔹 โฟลเดอร์เก็บไฟล์ json
+    OUTPUT_JSON_DIR = "json_results"
 
     YOLO_CONF = 0.3
     YOLO_IMGSZ = 960
@@ -40,6 +39,7 @@ class Config:
 
     OCR_TOP_CROP_RATIO = 0.45
     SSH_PATTERN = re.compile(r'SSH\d{3,}', re.IGNORECASE)
+
 
 # ==============================
 # PREPARE OUTPUT DIR
@@ -66,11 +66,18 @@ def validate_image(img: np.ndarray) -> bool:
         img.shape[1] >= 10
     )
 
+
 def enhance_image(img: np.ndarray) -> Optional[np.ndarray]:
     try:
-        img = cv2.resize(img, None, fx=Config.RESIZE_SCALE, fy=Config.RESIZE_SCALE, interpolation=cv2.INTER_CUBIC)
+        img = cv2.resize(
+            img, None,
+            fx=Config.RESIZE_SCALE,
+            fy=Config.RESIZE_SCALE,
+            interpolation=cv2.INTER_CUBIC
+        )
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         gray = cv2.fastNlMeansDenoising(gray, h=Config.DENOISE_H)
+
         return cv2.adaptiveThreshold(
             gray, 255,
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
@@ -81,20 +88,10 @@ def enhance_image(img: np.ndarray) -> Optional[np.ndarray]:
     except:
         return None
 
-# ==============================
-# QR + OCR
-# ==============================
-def read_qr(img: np.ndarray) -> Optional[str]:
-    for qr in decode(img):
-        try:
-            data = qr.data.decode("utf-8")
-            m = Config.SSH_PATTERN.search(data)
-            if m:
-                return m.group(0).upper()
-        except:
-            pass
-    return None
 
+# ==============================
+# OCR ONLY
+# ==============================
 def read_ssh_from_ocr(img: np.ndarray) -> Optional[str]:
     h = img.shape[0]
     img = img[int(h * Config.OCR_TOP_CROP_RATIO):, :]
@@ -114,8 +111,9 @@ def read_ssh_from_ocr(img: np.ndarray) -> Optional[str]:
 
     return best
 
+
 # ==============================
-# MAIN LOGIC
+# MAIN LOGIC (NO QR)
 # ==============================
 def detect_ssh_code(img: np.ndarray) -> Dict:
     start = time.time()
@@ -138,16 +136,6 @@ def detect_ssh_code(img: np.ndarray) -> Dict:
             if not validate_image(crop):
                 continue
 
-            qr = read_qr(crop)
-            if qr:
-                return {
-                    "status": "success",
-                    "code": qr,
-                    "source": "QR",
-                    "confidence": 1.0,
-                    "processing_time": f"{time.time() - start:.2f}s"
-                }
-
             processed = enhance_image(crop)
             if processed is not None:
                 ocr = read_ssh_from_ocr(processed)
@@ -166,6 +154,7 @@ def detect_ssh_code(img: np.ndarray) -> Dict:
         "processing_time": f"{time.time() - start:.2f}s"
     }
 
+
 # ==============================
 # SAVE RESULT TO JSON FILE
 # ==============================
@@ -179,6 +168,7 @@ def save_json_result(result: Dict):
         json.dump(result, f, ensure_ascii=False, indent=2)
 
     logger.info(f"📄 JSON saved: {path}")
+
 
 # ==============================
 # API
@@ -197,12 +187,10 @@ def ocr_image():
         return jsonify({"status": "error", "message": "Invalid image"}), 400
 
     result = detect_ssh_code(img)
-
-    # 🔹 บันทึกไฟล์ JSON เพิ่ม
     save_json_result(result)
 
-    # 🔹 ตอบ API เป็น JSON เหมือนเดิม
     return jsonify(result)
+
 
 # ==============================
 # RUN
