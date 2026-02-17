@@ -5,7 +5,7 @@ import cv2
 import numpy as np
 import re
 import logging
-from typing import Optional, Dict
+from typing import Optional, Dict, List, Tuple
 import time
 import json
 import os
@@ -24,38 +24,28 @@ logger = logging.getLogger(__name__)
 
 
 class Config:
-    MODEL_PATH = "D:/gog/AI_ocr/model/best_v8.pt"
+    MODEL_PATH = "D:/gog/best26.pt"
     PORT = 8000
-
     OUTPUT_JSON_DIR = "json_results"
-
     YOLO_CONF = 0.3
-    YOLO_IMGSZ = 960
-
-    RESIZE_SCALE = 3
+    YOLO_IMGSZ = 640
+    RESIZE_SCALE = 2.0
     DENOISE_H = 20
     ADAPTIVE_THRESH_BLOCK = 31
     ADAPTIVE_THRESH_C = 10
-
     OCR_TOP_CROP_RATIO = 0.45
-    SSH_PATTERN = re.compile(r'SSH\d{3,}', re.IGNORECASE)
+    SSH_PATTERN = re.compile(r'SSH\s*\d{3,}', re.IGNORECASE)
+    SSH_LOOSE_PATTERN = re.compile(r'[S5][S5H][SH0-9][\s\-_]*\d{2,}', re.IGNORECASE)
 
 
-# ==============================
-# PREPARE OUTPUT DIR
-# ==============================
 os.makedirs(Config.OUTPUT_JSON_DIR, exist_ok=True)
-
-# ==============================
-# LOAD MODELS
-# ==============================
 model = YOLO(Config.MODEL_PATH)
-reader = easyocr.Reader(['en'], gpu=False, verbose=False)
-
+reader = easyocr.Reader(['en'], gpu=True, verbose=False)
 app = Flask(__name__)
 
+
 # ==============================
-# IMAGE UTILS
+# IMAGE VALIDATION
 # ==============================
 def validate_image(img: np.ndarray) -> bool:
     return (
@@ -67,112 +57,353 @@ def validate_image(img: np.ndarray) -> bool:
     )
 
 
-def enhance_image(img: np.ndarray) -> Optional[np.ndarray]:
-    try:
-        img = cv2.resize(
-            img, None,
-            fx=Config.RESIZE_SCALE,
-            fy=Config.RESIZE_SCALE,
-            interpolation=cv2.INTER_CUBIC
-        )
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        gray = cv2.fastNlMeansDenoising(gray, h=Config.DENOISE_H)
+# ==============================
+# PREPROCESSING STRATEGIES
+# ==============================
 
-        return cv2.adaptiveThreshold(
+def preprocess_v1_clahe(img: np.ndarray) -> Optional[np.ndarray]:
+    """Strategy 1: CLAHE (original approach, fast)"""
+    try:
+        img = cv2.resize(img, None, fx=Config.RESIZE_SCALE, fy=Config.RESIZE_SCALE,
+                         interpolation=cv2.INTER_LINEAR)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        return clahe.apply(gray)
+    except Exception as e:
+        logger.warning(f"[v1] failed: {e}")
+        return None
+
+
+def preprocess_v2_adaptive_thresh(img: np.ndarray) -> Optional[np.ndarray]:
+    """Strategy 2: Adaptive Threshold - ดีสำหรับรูปที่มีแสงไม่สม่ำเสมอ"""
+    try:
+        img = cv2.resize(img, None, fx=Config.RESIZE_SCALE, fy=Config.RESIZE_SCALE,
+                         interpolation=cv2.INTER_CUBIC)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        # denoise ก่อน
+        gray = cv2.fastNlMeansDenoising(gray, h=15)
+        thresh = cv2.adaptiveThreshold(
             gray, 255,
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
             cv2.THRESH_BINARY,
             Config.ADAPTIVE_THRESH_BLOCK,
             Config.ADAPTIVE_THRESH_C
         )
-    except:
+        return thresh
+    except Exception as e:
+        logger.warning(f"[v2] failed: {e}")
         return None
 
 
+def preprocess_v3_otsu(img: np.ndarray) -> Optional[np.ndarray]:
+    """Strategy 3: Otsu Binarization - ดีสำหรับภาพที่มี contrast ชัดเจน"""
+    try:
+        img = cv2.resize(img, None, fx=Config.RESIZE_SCALE, fy=Config.RESIZE_SCALE,
+                         interpolation=cv2.INTER_CUBIC)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        return thresh
+    except Exception as e:
+        logger.warning(f"[v3] failed: {e}")
+        return None
+
+
+def preprocess_v4_sharpened(img: np.ndarray) -> Optional[np.ndarray]:
+    """Strategy 4: Sharpen + CLAHE - ดีสำหรับภาพเบลอ"""
+    try:
+        img = cv2.resize(img, None, fx=Config.RESIZE_SCALE * 1.5, fy=Config.RESIZE_SCALE * 1.5,
+                         interpolation=cv2.INTER_CUBIC)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        # Unsharp masking
+        blurred = cv2.GaussianBlur(gray, (5, 5), 1.0)
+        sharpened = cv2.addWeighted(gray, 1.8, blurred, -0.8, 0)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
+        return clahe.apply(sharpened)
+    except Exception as e:
+        logger.warning(f"[v4] failed: {e}")
+        return None
+
+
+def preprocess_v5_inverted(img: np.ndarray) -> Optional[np.ndarray]:
+    """Strategy 5: Inverted - ดีสำหรับตัวอักษรสีอ่อนบนพื้นมืด"""
+    try:
+        img = cv2.resize(img, None, fx=Config.RESIZE_SCALE, fy=Config.RESIZE_SCALE,
+                         interpolation=cv2.INTER_LINEAR)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        inverted = cv2.bitwise_not(gray)
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        return clahe.apply(inverted)
+    except Exception as e:
+        logger.warning(f"[v5] failed: {e}")
+        return None
+
+
+def preprocess_v6_morph(img: np.ndarray) -> Optional[np.ndarray]:
+    """Strategy 6: Morphological cleanup - ดีสำหรับภาพที่มี noise เยอะ"""
+    try:
+        img = cv2.resize(img, None, fx=Config.RESIZE_SCALE, fy=Config.RESIZE_SCALE,
+                         interpolation=cv2.INTER_CUBIC)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        # dilate จะทำให้ตัวอักษรชัดขึ้น
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        gray = cv2.dilate(gray, kernel, iterations=1)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        gray = clahe.apply(gray)
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        return binary
+    except Exception as e:
+        logger.warning(f"[v6] failed: {e}")
+        return None
+
+
+ALL_PREPROCESS_STRATEGIES = [
+    ("v1_clahe", preprocess_v1_clahe),
+    ("v2_adaptive", preprocess_v2_adaptive_thresh),
+    ("v3_otsu", preprocess_v3_otsu),
+    ("v4_sharp", preprocess_v4_sharpened),
+    ("v5_inverted", preprocess_v5_inverted),
+    ("v6_morph", preprocess_v6_morph),
+]
+
+
 # ==============================
-# OCR ONLY
+# OCR TEXT CLEANER
 # ==============================
-def read_ssh_from_ocr(img: np.ndarray) -> Optional[str]:
-    h = img.shape[0]
-    img = img[int(h * Config.OCR_TOP_CROP_RATIO):, :]
 
-    results = reader.readtext(
-        img,
-        allowlist="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
-    )
+def clean_ssh_text(text: str) -> str:
+    """ทำความสะอาด text ที่ OCR อ่านมาก่อน match pattern"""
+    text = text.replace(" ", "").replace("\n", "")
+    # Common OCR mistakes
+    replacements = {
+        "O": "0", "o": "0",
+        "l": "1", "I": "1", "|": "1",
+        "Z": "2", "z": "2",
+        "S": "S", "5": "5",  # S และ 5 มักสลับกัน ให้คงไว้ทั้งคู่
+        "B": "8",
+        "G": "6",
+        "Q": "0",
+    }
+    # Apply only to digit positions (หลัง SSH)
+    m = re.search(r'(SSH|5SH|SSH|SSH|5S4|5SH)(\S+)', text, re.IGNORECASE)
+    if m:
+        prefix = "SSH"
+        suffix = m.group(2)
+        # ทำความสะอาดส่วน suffix (ตัวเลข)
+        cleaned_suffix = ""
+        for c in suffix:
+            cleaned_suffix += replacements.get(c, c)
+        return prefix + cleaned_suffix
+    return text
 
-    best, best_conf = None, 0
-    for _, text, conf in results:
-        text = text.replace(" ", "").replace("O", "0")
-        m = Config.SSH_PATTERN.search(text)
-        if m and conf > best_conf:
-            best = m.group(0).upper()
-            best_conf = conf
 
-    return best
+def extract_ssh_from_text(text: str) -> Optional[Tuple[str, float]]:
+    """
+    พยายาม extract SSH code จาก text ด้วย pattern matching หลายแบบ
+    Returns (code, confidence_score) หรือ None
+    """
+    text_clean = text.replace(" ", "").upper()
+
+    # Pattern 1: Exact SSH
+    m = Config.SSH_PATTERN.search(text_clean)
+    if m:
+        code = re.sub(r'[^A-Z0-9]', '', m.group(0)).upper()
+        return code, 1.0
+
+    # Pattern 2: ยอมรับ OCR ผิดเล็กน้อย เช่น 5SH, 55H, SSH
+    loose = re.search(r'[S5]{1,2}[SH5][H0-9]?[\s\-_]*(\d{3,})', text_clean)
+    if loose:
+        code = "SSH" + loose.group(1)
+        return code, 0.75
+
+    # Pattern 3: มีตัวเลข 4+ หลักแต่ prefix ไม่ชัด
+    nums = re.search(r'(\d{4,})', text_clean)
+    if nums and len(text_clean) < 12:
+        code = "SSH" + nums.group(1)
+        return code, 0.5
+
+    return None
 
 
 # ==============================
-# MAIN LOGIC (NO QR)
+# OCR FUNCTIONS
 # ==============================
+
+def run_easyocr(img_gray: np.ndarray, top_crop: bool = True) -> List[Tuple[str, float]]:
+    """Run EasyOCR และคืน list ของ (text, confidence)"""
+    try:
+        h = img_gray.shape[0]
+        img = img_gray[int(h * Config.OCR_TOP_CROP_RATIO):, :] if top_crop else img_gray
+
+        results = reader.readtext(
+            img,
+            allowlist="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
+            paragraph=False,
+            detail=1,
+        )
+        return [(text, conf) for (_, text, conf) in results]
+    except Exception as e:
+        logger.warning(f"EasyOCR error: {e}")
+        return []
+
+
+def run_tesseract(img_gray: np.ndarray, top_crop: bool = True) -> List[Tuple[str, float]]:
+    """Run Tesseract OCR เป็น fallback"""
+    try:
+        h = img_gray.shape[0]
+        img = img_gray[int(h * Config.OCR_TOP_CROP_RATIO):, :] if top_crop else img_gray
+
+        # Tesseract config: single line, alphanumeric only
+        configs = [
+            '--psm 7 --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
+            '--psm 8 --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
+            '--psm 6 --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
+        ]
+        results = []
+        for cfg in configs:
+            text = pytesseract.image_to_string(img, config=cfg).strip()
+            if text:
+                results.append((text, 0.6))  # tesseract ไม่มี confidence โดยตรง
+        return results
+    except Exception as e:
+        logger.warning(f"Tesseract error: {e}")
+        return []
+
+
+def try_all_ocr(processed_img: np.ndarray) -> Optional[Tuple[str, float, str]]:
+    """
+    ลอง EasyOCR + Tesseract บน processed image
+    Returns (code, confidence, engine) หรือ None
+    """
+    # --- EasyOCR: crop บน ---
+    for text, conf in run_easyocr(processed_img, top_crop=True):
+        cleaned = clean_ssh_text(text)
+        result = extract_ssh_from_text(cleaned)
+        if result:
+            code, score = result
+            return code, conf * score, "easyocr_cropped"
+
+    # --- EasyOCR: full image (ไม่ crop) ---
+    for text, conf in run_easyocr(processed_img, top_crop=False):
+        cleaned = clean_ssh_text(text)
+        result = extract_ssh_from_text(cleaned)
+        if result:
+            code, score = result
+            return code, conf * score, "easyocr_full"
+
+    # --- Tesseract fallback ---
+    for text, conf in run_tesseract(processed_img, top_crop=True):
+        cleaned = clean_ssh_text(text)
+        result = extract_ssh_from_text(cleaned)
+        if result:
+            code, score = result
+            return code, conf * score, "tesseract_cropped"
+
+    for text, conf in run_tesseract(processed_img, top_crop=False):
+        cleaned = clean_ssh_text(text)
+        result = extract_ssh_from_text(cleaned)
+        if result:
+            code, score = result
+            return code, conf * score, "tesseract_full"
+
+    return None
+
+
+# ==============================
+# MAIN DETECTION PIPELINE
+# ==============================
+
 def detect_ssh_code(img: np.ndarray) -> Dict:
     start = time.time()
+    detected = False
 
     results = model.predict(
         source=img,
         conf=Config.YOLO_CONF,
         imgsz=Config.YOLO_IMGSZ,
-        verbose=False
+        verbose=False,
+        max_det=2,
+        device=0,
+        half=True
     )
 
     for r in results:
         if not r.boxes:
             continue
+        detected = True
 
         for box in sorted(r.boxes, key=lambda x: x.conf[0], reverse=True):
             x1, y1, x2, y2 = map(int, box.xyxy[0])
-            crop = img[y1:y2, x1:x2]
 
+            # ขยาย bounding box เล็กน้อยเผื่อ text ถูก crop ออก
+            pad_x = int((x2 - x1) * 0.05)
+            pad_y = int((y2 - y1) * 0.05)
+            x1 = max(0, x1 - pad_x)
+            y1 = max(0, y1 - pad_y)
+            x2 = min(img.shape[1], x2 + pad_x)
+            y2 = min(img.shape[0], y2 + pad_y)
+
+            crop = img[y1:y2, x1:x2]
             if not validate_image(crop):
                 continue
 
-            processed = enhance_image(crop)
-            if processed is not None:
-                ocr = read_ssh_from_ocr(processed)
-                if ocr:
+            logger.info(f"🔍 Trying crop size: {crop.shape} | yolo_conf: {box.conf[0]:.2f}")
+
+            # ลอง preprocess ทุก strategy
+            for strategy_name, preprocess_fn in ALL_PREPROCESS_STRATEGIES:
+                processed = preprocess_fn(crop)
+                if processed is None:
+                    continue
+
+                ocr_result = try_all_ocr(processed)
+                if ocr_result:
+                    code, confidence, engine = ocr_result
+                    elapsed = time.time() - start
+                    logger.info(f"✅ SUCCESS | code={code} | strategy={strategy_name} | engine={engine} | time={elapsed:.2f}s")
                     return {
                         "status": "success",
-                        "code": ocr,
-                        "source": "OCR",
+                        "message": "Detect และ OCR สำเร็จ",
+                        "code": code,
+                        "source": f"{engine}+{strategy_name}",
                         "confidence": float(box.conf[0]),
-                        "processing_time": f"{time.time() - start:.2f}s"
+                        "ocr_confidence": round(confidence, 3),
+                        "processing_time": f"{elapsed:.2f}s"
                     }
 
+            logger.warning("⚠️ All strategies failed for this box")
+
+    if detected:
+        return {
+            "status": "detected_no_ocr",
+            "message": "Detect เจอป้าย แต่ OCR อ่าน SSH ไม่ได้ (ลองแล้วทุก strategy)",
+            "processing_time": f"{time.time() - start:.2f}s"
+        }
+
     return {
-        "status": "not_found",
-        "message": "ไม่พบรหัสเครื่อง (SSH)",
+        "status": "not_detected",
+        "message": "YOLO ไม่พบป้าย",
         "processing_time": f"{time.time() - start:.2f}s"
     }
 
 
 # ==============================
-# SAVE RESULT TO JSON FILE
+# SAVE JSON
 # ==============================
+
 def save_json_result(result: Dict):
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     code = result.get("code", "NO_CODE")
     filename = f"{timestamp}_{code}.json"
-
     path = os.path.join(Config.OUTPUT_JSON_DIR, filename)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
-
     logger.info(f"📄 JSON saved: {path}")
 
 
 # ==============================
 # API
 # ==============================
+
 @app.route("/ocr", methods=["POST"])
 def ocr_image():
     if "file" not in request.files:
@@ -182,19 +413,66 @@ def ocr_image():
         np.frombuffer(request.files["file"].read(), np.uint8),
         cv2.IMREAD_COLOR
     )
-
     if not validate_image(img):
         return jsonify({"status": "error", "message": "Invalid image"}), 400
 
     result = detect_ssh_code(img)
     save_json_result(result)
-
     return jsonify(result)
+
+
+# ==============================
+# DEBUG ENDPOINT (optional)
+# ==============================
+
+@app.route("/debug", methods=["POST"])
+def debug_image():
+    """
+    Endpoint สำหรับ debug: แสดงผลลัพธ์จากทุก strategy
+    ไม่ต้องใช้ YOLO ทำ crop เอง ส่งภาพป้ายมาตรง ๆ ได้เลย
+    """
+    if "file" not in request.files:
+        return jsonify({"status": "error", "message": "No file uploaded"}), 400
+
+    img = cv2.imdecode(
+        np.frombuffer(request.files["file"].read(), np.uint8),
+        cv2.IMREAD_COLOR
+    )
+    if not validate_image(img):
+        return jsonify({"status": "error", "message": "Invalid image"}), 400
+
+    debug_results = []
+    for strategy_name, preprocess_fn in ALL_PREPROCESS_STRATEGIES:
+        processed = preprocess_fn(img)
+        if processed is None:
+            debug_results.append({"strategy": strategy_name, "result": "preprocess_failed"})
+            continue
+
+        easy_texts = [(t, c, "easyocr") for t, c in run_easyocr(processed, top_crop=False)]
+        tess_texts = [(t, c, "tesseract") for t, c in run_tesseract(processed, top_crop=False)]
+
+        all_texts = easy_texts + tess_texts
+        found = None
+        for text, conf, engine in all_texts:
+            cleaned = clean_ssh_text(text)
+            r = extract_ssh_from_text(cleaned)
+            if r:
+                found = {"code": r[0], "score": r[1], "engine": engine, "raw_text": text}
+                break
+
+        debug_results.append({
+            "strategy": strategy_name,
+            "raw_texts": [(t, round(c, 3)) for t, c, _ in all_texts[:5]],
+            "found": found
+        })
+
+    return jsonify({"debug": debug_results})
 
 
 # ==============================
 # RUN
 # ==============================
+
 if __name__ == "__main__":
     logger.info(f"🚀 Starting OCR API on port {Config.PORT}")
     app.run(host="0.0.0.0", port=Config.PORT, debug=False)
