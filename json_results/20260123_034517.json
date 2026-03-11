@@ -1,0 +1,39 @@
+{
+  "status": "success",
+  "processing_time": "13.88s",
+  "results": {
+    "qr": null,
+    "yolo_v8": {
+      "detected": true,
+      "yolo_confidence": 0.9201925992965698,
+      "easyocr": {
+        "text": "SSH01701",
+        "confidence": 0.892
+      },
+      "tesseract": {
+        "text": null,
+        "confidence": 0.0
+      },
+      "paddleocr": {
+        "text": null,
+        "confidence": 0.0
+      }
+    },
+    "yolo_v11": {
+      "detected": true,
+      "yolo_confidence": 0.9307435154914856,
+      "easyocr": {
+        "text": "SSH01701",
+        "confidence": 0.985
+      },
+      "tesseract": {
+        "text": null,
+        "confidence": 0.0
+      },
+      "paddleocr": {
+        "text": null,
+        "confidence": 0.0
+      }
+    }
+  }
+}

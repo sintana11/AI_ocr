@@ -9,6 +9,9 @@ from typing import Optional, Dict, List, Tuple
 import time
 import json
 import os
+import pytesseract
+
+pytesseract.pytesseract.tesseract_cmd = r"D:/Tesseract-OCR/tesseract.exe"
 
 
 # ==============================
