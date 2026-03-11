@@ -13,7 +13,6 @@ import pytesseract
 
 pytesseract.pytesseract.tesseract_cmd = r"D:/Tesseract-OCR/tesseract.exe"
 
-
 # ==============================
 # LOGGING SETUP
 # ==============================
@@ -25,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 
 class Config:
-    MODEL_PATH = "D:/gog/V11newest1/weights/best.pt"
+    MODEL_PATH = "D:/gog/best26.pt"
     PORT = 8000
     OUTPUT_JSON_DIR = "json_results"
     YOLO_CONF = 0.3
@@ -37,12 +36,6 @@ class Config:
     OCR_TOP_CROP_RATIO = 0.45
     SSH_PATTERN = re.compile(r'SSH\s*\d{3,}', re.IGNORECASE)
     SSH_LOOSE_PATTERN = re.compile(r'[S5][S5H][SH0-9][\s\-_]*\d{2,}', re.IGNORECASE)
-    GENERAL_CODE_PATTERN = re.compile(r'[A-Z]{2,5}[\s\-_]*\d{2,}', re.IGNORECASE)
-    LABEL_NOISE_WORDS = {
-        "HEALTH", "BIOMEDICAL", "ENGINEERING", "SERVICE", "MEDIUM",
-        "RISK", "DEVICE", "CALIBRATION", "DATE", "MODEL", "SERIAL",
-        "NHEALTH", "PAT", "NEXT", "DUE", "WARRANTY", "BRAND",
-    }
 
 
 os.makedirs(Config.OUTPUT_JSON_DIR, exist_ok=True)
@@ -178,109 +171,52 @@ ALL_PREPROCESS_STRATEGIES = [
 # OCR TEXT CLEANER
 # ==============================
 
-def clean_ocr_text(text: str) -> str:
-    """ทำความสะอาด text ที่ OCR อ่านมาก่อน match pattern
-    
-    แก้ปัญหา OCR artifacts เช่น:
-    - SSHO1701 → SSH01701 (O แปลงเป็น 0)
-    - SRHL00248 → SRH-00248 (L จากเส้น | บนป้ายโดนอ่านเป็นตัวอักษร)
-    - SRHG-00267 → SRHG-00267 (prefix 4 ตัวอักษร + dash + ตัวเลข)
-    - ABCDE-12345 → ABCDE-12345 (prefix 5 ตัวอักษร)
-    """
-    text = text.replace(" ", "").replace("\n", "").upper()
-    # ลบ _ และ | ออก แต่ยังเก็บ dash (-) ไว้ช่วยแยก prefix
-    text = re.sub(r'[_|]', '', text)
-
-    # === 1. SSH-specific cleaning ===
-    # หา SSH (รวม OCR ผิด เช่น 5SH, 55H, S5H)
-    # สำหรับ SSH: แปลง OCR artifacts เป็นตัวเลข (O→0, I→1) เพราะรหัส SSH ต่อด้วยเลขเสมอ
-    digit_map = {"O": "0", "I": "1", "L": "1", "Z": "2", "B": "8", "G": "6", "Q": "0"}
-    m_ssh = re.search(r'(SSH|5SH|55H|S5H|5S4)', text)
-    if m_ssh:
+def clean_ssh_text(text: str) -> str:
+    """ทำความสะอาด text ที่ OCR อ่านมาก่อน match pattern"""
+    text = text.replace(" ", "").replace("\n", "")
+    # Common OCR mistakes
+    replacements = {
+        "O": "0", "o": "0",
+        "l": "1", "I": "1", "|": "1",
+        "Z": "2", "z": "2",
+        "S": "S", "5": "5",  # S และ 5 มักสลับกัน ให้คงไว้ทั้งคู่
+        "B": "8",
+        "G": "6",
+        "Q": "0",
+    }
+    # Apply only to digit positions (หลัง SSH)
+    m = re.search(r'(SSH|5SH|SSH|SSH|5S4|5SH)(\S+)', text, re.IGNORECASE)
+    if m:
         prefix = "SSH"
-        rest = text[m_ssh.end():]
-        rest = re.sub(r'[-]', '', rest)
-        cleaned = ""
-        for c in rest:
-            cleaned += digit_map.get(c, c)
-        cleaned = re.sub(r'[^0-9]', '', cleaned)
-        if cleaned:
-            return prefix + cleaned
-
-    # === 2. มี dash separator → เชื่อ prefix ทั้งหมด (2-5 ตัว) ===
-    # เช่น SRHG-00267, AB-1234, EQUIP-001
-    m_sep = re.match(r'([A-Z]{2,5})-(\d+)', text)
-    if m_sep:
-        return m_sep.group(1) + "-" + m_sep.group(2)
-
-    # === 3. ไม่มี dash → prefix 2-3 ตัว + ข้าม artifact ตรง boundary + ใส่ dash + ตัวเลข ===
-    # เช่น SRHL00248 → SRH-00248 (skip L, insert dash)
-    # เช่น SRHF00258 → SRH-00258 (skip F, insert dash)
-    # (prefix 4+ ตัวให้ใช้ dash ช่วยแยกใน step 2)
-    text_no_dash = re.sub(r'[-]', '', text)
-    m_gen = re.match(r'([A-Z]{2,3})\D*(\d+)', text_no_dash)
-    if m_gen:
-        return m_gen.group(1) + "-" + m_gen.group(2)
-
-    return text_no_dash
+        suffix = m.group(2)
+        # ทำความสะอาดส่วน suffix (ตัวเลข)
+        cleaned_suffix = ""
+        for c in suffix:
+            cleaned_suffix += replacements.get(c, c)
+        return prefix + cleaned_suffix
+    return text
 
 
-def _is_label_noise(code: str) -> bool:
-    """ตรวจว่า code ที่ได้มาเป็นคำที่อยู่บนป้ายแต่ไม่ใช่รหัสครุภัณฑ์"""
-    # แยก prefix (ตัวอักษรนำหน้า) ออกมาเช็ค
-    prefix_match = re.match(r'([A-Z]+)', code)
-    if prefix_match:
-        prefix = prefix_match.group(1)
-        if prefix in Config.LABEL_NOISE_WORDS:
-            return True
-    return False
-
-
-def extract_code_from_text(text: str) -> Optional[Tuple[str, float]]:
+def extract_ssh_from_text(text: str) -> Optional[Tuple[str, float]]:
     """
-    พยายาม extract equipment code จาก text ด้วย pattern matching หลายแบบ
-    รองรับทั้ง SSH, SRH, SRHG, และรูปแบบอื่น ๆ
+    พยายาม extract SSH code จาก text ด้วย pattern matching หลายแบบ
     Returns (code, confidence_score) หรือ None
     """
     text_clean = text.replace(" ", "").upper()
 
-    # Priority 1: Exact SSH (เดิม — confidence สูงสุด)
+    # Pattern 1: Exact SSH
     m = Config.SSH_PATTERN.search(text_clean)
     if m:
         code = re.sub(r'[^A-Z0-9]', '', m.group(0)).upper()
         return code, 1.0
 
-    # Priority 2: SSH ที่ OCR อ่านผิดเล็กน้อย เช่น 5SH, 55H, SSHO4582
-    # ใช้ digit_map แปลง O→0, I→1 ฯลฯ ก่อน match เพื่อไม่ให้ตัวเลขหาย
-    digit_map = {"O": "0", "I": "1", "L": "1", "Z": "2", "B": "8", "G": "6", "Q": "0"}
-    ssh_prefix = re.search(r'(SSH|5SH|55H|S5H|5S4)', text_clean)
-    if ssh_prefix:
-        rest = text_clean[ssh_prefix.end():]
-        rest = re.sub(r'[-]', '', rest)
-        # แปลง OCR artifacts เป็นตัวเลข
-        cleaned_digits = ""
-        for c in rest:
-            cleaned_digits += digit_map.get(c, c)
-        cleaned_digits = re.sub(r'[^0-9]', '', cleaned_digits)
-        if len(cleaned_digits) >= 3:
-            return "SSH" + cleaned_digits, 0.85
-
-    # Priority 2b: Loose match สำหรับ SSH ที่ prefix ก็อ่านผิดด้วย
+    # Pattern 2: ยอมรับ OCR ผิดเล็กน้อย เช่น 5SH, 55H, SSH
     loose = re.search(r'[S5]{1,2}[SH5][H0-9]?[\s\-_]*(\d{3,})', text_clean)
     if loose:
         code = "SSH" + loose.group(1)
         return code, 0.75
 
-    # Priority 3: General equipment code — ตัวอักษร 2-5 ตัว + ตัวเลข 2+ หลัก
-    # เช่น SRH00248, SRHG00267, ABC1234, EQUIP001
-    gen = Config.GENERAL_CODE_PATTERN.search(text_clean)
-    if gen:
-        code = re.sub(r'[^A-Z0-9\-]', '', gen.group(0)).upper()
-        # กรอง false positive: ต้องยาวพอ + ไม่ใช่คำบนป้าย
-        if len(code) >= 4 and not _is_label_noise(code):
-            return code, 0.9
-
-    # Priority 4: มีตัวเลข 4+ หลักแต่ prefix ไม่ชัด → ลอง SSH เป็น fallback
+    # Pattern 3: มีตัวเลข 4+ หลักแต่ prefix ไม่ชัด
     nums = re.search(r'(\d{4,})', text_clean)
     if nums and len(text_clean) < 12:
         code = "SSH" + nums.group(1)
@@ -301,7 +237,7 @@ def run_easyocr(img_gray: np.ndarray, top_crop: bool = True) -> List[Tuple[str, 
 
         results = reader.readtext(
             img,
-            allowlist="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-",
+            allowlist="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
             paragraph=False,
             detail=1,
         )
@@ -311,28 +247,64 @@ def run_easyocr(img_gray: np.ndarray, top_crop: bool = True) -> List[Tuple[str, 
         return []
 
 
+def run_tesseract(img_gray: np.ndarray, top_crop: bool = True) -> List[Tuple[str, float]]:
+    """Run Tesseract OCR เป็น fallback"""
+    try:
+        h = img_gray.shape[0]
+        img = img_gray[int(h * Config.OCR_TOP_CROP_RATIO):, :] if top_crop else img_gray
+
+        # Tesseract config: single line, alphanumeric only
+        configs = [
+            '--psm 7 --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
+            '--psm 8 --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
+            '--psm 6 --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
+        ]
+        results = []
+        for cfg in configs:
+            text = pytesseract.image_to_string(img, config=cfg).strip()
+            if text:
+                results.append((text, 0.6))  # tesseract ไม่มี confidence โดยตรง
+        return results
+    except Exception as e:
+        logger.warning(f"Tesseract error: {e}")
+        return []
 
 
 def try_all_ocr(processed_img: np.ndarray) -> Optional[Tuple[str, float, str]]:
     """
-    ลอง EasyOCR บน processed image
+    ลอง EasyOCR + Tesseract บน processed image
     Returns (code, confidence, engine) หรือ None
     """
     # --- EasyOCR: crop บน ---
     for text, conf in run_easyocr(processed_img, top_crop=True):
-        cleaned = clean_ocr_text(text)
-        result = extract_code_from_text(cleaned)
+        cleaned = clean_ssh_text(text)
+        result = extract_ssh_from_text(cleaned)
         if result:
             code, score = result
             return code, conf * score, "easyocr_cropped"
 
     # --- EasyOCR: full image (ไม่ crop) ---
     for text, conf in run_easyocr(processed_img, top_crop=False):
-        cleaned = clean_ocr_text(text)
-        result = extract_code_from_text(cleaned)
+        cleaned = clean_ssh_text(text)
+        result = extract_ssh_from_text(cleaned)
         if result:
             code, score = result
             return code, conf * score, "easyocr_full"
+
+    # --- Tesseract fallback ---
+    for text, conf in run_tesseract(processed_img, top_crop=True):
+        cleaned = clean_ssh_text(text)
+        result = extract_ssh_from_text(cleaned)
+        if result:
+            code, score = result
+            return code, conf * score, "tesseract_cropped"
+
+    for text, conf in run_tesseract(processed_img, top_crop=False):
+        cleaned = clean_ssh_text(text)
+        result = extract_ssh_from_text(cleaned)
+        if result:
+            code, score = result
+            return code, conf * score, "tesseract_full"
 
     return None
 
@@ -403,7 +375,7 @@ def detect_ssh_code(img: np.ndarray) -> Dict:
     if detected:
         return {
             "status": "detected_no_ocr",
-            "message": "Detect เจอป้าย แต่ OCR อ่านรหัสไม่ได้ (ลองแล้วทุก strategy)",
+            "message": "Detect เจอป้าย แต่ OCR อ่าน SSH ไม่ได้ (ลองแล้วทุก strategy)",
             "processing_time": f"{time.time() - start:.2f}s"
         }
 
@@ -476,11 +448,14 @@ def debug_image():
             debug_results.append({"strategy": strategy_name, "result": "preprocess_failed"})
             continue
 
-        all_texts = [(t, c, "easyocr") for t, c in run_easyocr(processed, top_crop=False)]
+        easy_texts = [(t, c, "easyocr") for t, c in run_easyocr(processed, top_crop=False)]
+        tess_texts = [(t, c, "tesseract") for t, c in run_tesseract(processed, top_crop=False)]
+
+        all_texts = easy_texts + tess_texts
         found = None
         for text, conf, engine in all_texts:
-            cleaned = clean_ocr_text(text)
-            r = extract_code_from_text(cleaned)
+            cleaned = clean_ssh_text(text)
+            r = extract_ssh_from_text(cleaned)
             if r:
                 found = {"code": r[0], "score": r[1], "engine": engine, "raw_text": text}
                 break
