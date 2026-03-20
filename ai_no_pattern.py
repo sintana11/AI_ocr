@@ -1,0 +1,717 @@
+from flask import Flask, request, jsonify
+from ultralytics import YOLO
+import easyocr
+from collections import Counter, defaultdict
+import cv2
+import numpy as np
+import re
+import logging
+from typing import Optional, Dict, List, Tuple
+import time
+import json
+import os
+
+# ==============================
+# LOGGING SETUP
+# ==============================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+class Config:
+    MODEL_PATH = "D:/New folder/Model/train_20260318_024752/weights/best.pt"
+    PORT = 8000
+    OUTPUT_JSON_DIR = "json_results"
+    OUTPUT_RUNS_DIR = "ocr_runs"
+    YOLO_CONF = 0.1
+    YOLO_IMGSZ = 640
+    RESIZE_SCALE = 2.0
+    DENOISE_H = 20
+    ADAPTIVE_THRESH_BLOCK = 31
+    ADAPTIVE_THRESH_C = 10
+    OCR_TOP_CROP_RATIO = 0.45
+    LABEL_NOISE_WORDS = {
+        "HEALTH", "BIOMEDICAL", "ENGINEERING", "SERVICE", "MEDIUM",
+        "RISK", "DEVICE", "CALIBRATION", "DATE", "MODEL", "SERIAL",
+        "NHEALTH", "PAT", "NEXT", "DUE", "WARRANTY", "BRAND",
+    }
+
+
+os.makedirs(Config.OUTPUT_JSON_DIR, exist_ok=True)
+os.makedirs(Config.OUTPUT_RUNS_DIR, exist_ok=True)
+model = YOLO(Config.MODEL_PATH)
+reader = easyocr.Reader(['en'], gpu=True, verbose=False)
+app = Flask(__name__)
+
+
+# ==============================
+# IMAGE VALIDATION
+# ==============================
+def validate_image(img: np.ndarray) -> bool:
+    return (
+        img is not None and
+        img.size > 0 and
+        len(img.shape) >= 2 and
+        img.shape[0] >= 10 and
+        img.shape[1] >= 10
+    )
+
+
+# ==============================
+# PREPROCESSING STRATEGIES
+# ==============================
+
+def preprocess_v1_clahe(img: np.ndarray) -> Optional[np.ndarray]:
+    """Strategy 1: CLAHE (original approach, fast)"""
+    try:
+        img = cv2.resize(img, None, fx=Config.RESIZE_SCALE, fy=Config.RESIZE_SCALE,
+                         interpolation=cv2.INTER_LINEAR)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        return clahe.apply(gray)
+    except Exception as e:
+        logger.warning(f"[v1] failed: {e}")
+        return None
+
+
+def preprocess_v2_adaptive_thresh(img: np.ndarray) -> Optional[np.ndarray]:
+    try:
+        img = cv2.resize(img, None, fx=Config.RESIZE_SCALE, fy=Config.RESIZE_SCALE,
+                         interpolation=cv2.INTER_CUBIC)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        gray = cv2.fastNlMeansDenoising(gray, h=15)
+        thresh = cv2.adaptiveThreshold(
+            gray, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            Config.ADAPTIVE_THRESH_BLOCK,
+            Config.ADAPTIVE_THRESH_C
+        )
+        return thresh
+    except Exception as e:
+        logger.warning(f"[v2] failed: {e}")
+        return None
+
+
+def preprocess_v3_otsu(img: np.ndarray) -> Optional[np.ndarray]:
+    try:
+        img = cv2.resize(img, None, fx=Config.RESIZE_SCALE, fy=Config.RESIZE_SCALE,
+                         interpolation=cv2.INTER_CUBIC)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        return thresh
+    except Exception as e:
+        logger.warning(f"[v3] failed: {e}")
+        return None
+
+
+def preprocess_v4_sharpened(img: np.ndarray) -> Optional[np.ndarray]:
+    try:
+        img = cv2.resize(img, None, fx=Config.RESIZE_SCALE * 1.5, fy=Config.RESIZE_SCALE * 1.5,
+                         interpolation=cv2.INTER_CUBIC)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 1.0)
+        sharpened = cv2.addWeighted(gray, 1.8, blurred, -0.8, 0)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
+        return clahe.apply(sharpened)
+    except Exception as e:
+        logger.warning(f"[v4] failed: {e}")
+        return None
+
+
+def preprocess_v5_inverted(img: np.ndarray) -> Optional[np.ndarray]:
+    try:
+        img = cv2.resize(img, None, fx=Config.RESIZE_SCALE, fy=Config.RESIZE_SCALE,
+                         interpolation=cv2.INTER_LINEAR)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        inverted = cv2.bitwise_not(gray)
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        return clahe.apply(inverted)
+    except Exception as e:
+        logger.warning(f"[v5] failed: {e}")
+        return None
+
+
+def preprocess_v6_morph(img: np.ndarray) -> Optional[np.ndarray]:
+    try:
+        img = cv2.resize(img, None, fx=Config.RESIZE_SCALE, fy=Config.RESIZE_SCALE,
+                         interpolation=cv2.INTER_CUBIC)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        gray = cv2.dilate(gray, kernel, iterations=1)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        gray = clahe.apply(gray)
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        return binary
+    except Exception as e:
+        logger.warning(f"[v6] failed: {e}")
+        return None
+
+
+def preprocess_v7_bilateral(img: np.ndarray) -> Optional[np.ndarray]:
+    try:
+        img = cv2.resize(img, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        gray = cv2.bilateralFilter(gray, 9, 75, 75)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        return clahe.apply(gray)
+    except Exception as e:
+        logger.warning(f"[v7] failed: {e}")
+        return None
+
+
+def preprocess_v8_highres(img: np.ndarray) -> Optional[np.ndarray]:
+    try:
+        img = cv2.resize(img, None, fx=4.0, fy=4.0, interpolation=cv2.INTER_CUBIC)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        gray = clahe.apply(gray)
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        return binary
+    except Exception as e:
+        logger.warning(f"[v8] failed: {e}")
+        return None
+
+
+ALL_PREPROCESS_STRATEGIES = [
+    ("v1_clahe", preprocess_v1_clahe),
+    ("v2_adaptive", preprocess_v2_adaptive_thresh),
+    ("v3_otsu", preprocess_v3_otsu),
+    ("v4_sharp", preprocess_v4_sharpened),
+    ("v5_inverted", preprocess_v5_inverted),
+    ("v6_morph", preprocess_v6_morph),
+    ("v7_bilateral", preprocess_v7_bilateral),
+    ("v8_highres", preprocess_v8_highres),
+]
+
+
+# ==============================
+# OCR TEXT CLEANER (ไม่กำหนด pattern)
+# ==============================
+
+def clean_ocr_text(text: str) -> str:
+    """ทำความสะอาด text เบื้องต้น"""
+    text = text.strip()
+    text = re.sub(r'[\n\r\t]+', ' ', text)
+    text = re.sub(r'[^\w\s\-./]', '', text)
+    return text.strip()
+
+
+def _is_label_noise(text: str) -> bool:
+    """ตรวจว่า text เป็นคำบนป้ายที่ไม่ใช่รหัสครุภัณฑ์ (fuzzy matching)"""
+    word = text.upper().strip()
+    alpha_part = re.sub(r'[^A-Z]', '', word)
+
+    # exact match
+    for noise in Config.LABEL_NOISE_WORDS:
+        if noise in word:
+            return True
+
+    # partial match: ถ้าส่วนตัวอักษร >= 3 ตัว ตรงกับ noise word
+    if len(alpha_part) >= 3:
+        for noise in Config.LABEL_NOISE_WORDS:
+            if alpha_part in noise or noise in alpha_part:
+                return True
+
+    # ตัวอักษรล้วน (ไม่มีตัวเลข) >= 3 → มักเป็นคำบนป้าย
+    if alpha_part == word and len(word) >= 3:
+        return True
+
+    return False
+
+
+def extract_text_no_pattern(text: str) -> Optional[Tuple[str, float]]:
+    """
+    ดึง text จาก OCR โดยไม่กำหนด pattern ตายตัว
+    - ต้องมีทั้งตัวอักษรและตัวเลข
+    - ต้องมีตัวเลขอย่างน้อย 3 ตัว (รหัสจริงมีตัวเลขเยอะ เช่น 04622, 00248)
+    - กรอง noise words
+    """
+    cleaned = clean_ocr_text(text)
+    if not cleaned or len(cleaned) < 4:
+        return None
+
+    upper = cleaned.upper()
+
+    if _is_label_noise(upper):
+        return None
+
+    alnum = re.sub(r'[^A-Z0-9\-]', '', upper)
+    if len(alnum) < 4:
+        return None
+
+    has_letter = bool(re.search(r'[A-Z]', alnum))
+    digits = re.findall(r'[0-9]', alnum)
+    if not has_letter or len(digits) < 3:
+        return None
+
+    score = min(1.0, len(alnum) / 8.0)
+    return alnum, score
+
+
+# ==============================
+# GENERAL OCR CORRECTION (ไม่ hardcode pattern ใดๆ)
+# ==============================
+
+DIGIT_TO_LETTER = {
+    '0': 'O', '1': 'I', '2': 'Z', '3': 'E',
+    '4': 'A', '5': 'S', '6': 'G', '8': 'S', '9': 'S'
+}
+LETTER_TO_DIGIT = {
+    'O': '0', 'I': '1', 'L': '1', 'Z': '2',
+    'S': '5', 'G': '6', 'B': '8', 'Q': '0', 'D': '0', 'C': '0'
+}
+
+
+def correct_ocr_by_context(text: str) -> str:
+    """
+    แก้ไข OCR misread โดยใช้ context ของตำแหน่ง (general — ไม่ hardcode pattern)
+
+    หลักการ: รหัสครุภัณฑ์ = prefix ตัวอักษร + suffix ตัวเลข
+    - ตำแหน่ง prefix: ตัวเลข → ตัวอักษร (เช่น 8→S, 9→S)
+    - ตำแหน่ง suffix: ตัวอักษร → ตัวเลข (เช่น O→0, S→5)
+
+    ตัวอย่าง: 89H04622 → SSH04622
+    """
+    text = text.upper().replace('-', '')
+    if len(text) < 3:
+        return text
+
+    # หาจุดแบ่ง prefix/suffix
+    split_pos = 0
+    for i in range(len(text)):
+        if text[i].isalpha():
+            rest = text[i + 1:]
+            digit_count = sum(1 for c in rest if c.isdigit())
+            if rest and digit_count / len(rest) >= 0.7:
+                split_pos = i + 1
+                break
+
+    if split_pos == 0:
+        for i in range(len(text)):
+            if text[i].isdigit():
+                rest = text[i:]
+                digit_count = sum(1 for c in rest if c.isdigit())
+                if digit_count / len(rest) >= 0.8:
+                    split_pos = i
+                    break
+
+    if split_pos == 0:
+        return text
+
+    prefix = text[:split_pos]
+    suffix = text[split_pos:]
+
+    # แก้ prefix: ตัวเลข → ตัวอักษร
+    corrected_prefix = ''
+    for c in prefix:
+        if c.isdigit() and c in DIGIT_TO_LETTER:
+            corrected_prefix += DIGIT_TO_LETTER[c]
+        else:
+            corrected_prefix += c
+
+    # แก้ suffix: ตัวอักษร → ตัวเลข
+    corrected_suffix = ''
+    for c in suffix:
+        if c.isalpha() and c in LETTER_TO_DIGIT:
+            corrected_suffix += LETTER_TO_DIGIT[c]
+        else:
+            corrected_suffix += c
+
+    result = corrected_prefix + corrected_suffix
+    if result != text:
+        logger.info(f"🔧 OCR correction: '{text}' → '{result}' (split at {split_pos})")
+
+    return result
+
+
+def build_positional_consensus(all_candidates: List[Tuple[str, float, str]]) -> Optional[str]:
+    """
+    สร้าง consensus code จาก candidates โดย vote ทีละตำแหน่ง
+    """
+    if not all_candidates:
+        return None
+
+    lengths = Counter(len(code) for code, _, _ in all_candidates)
+    target_len = lengths.most_common(1)[0][0]
+
+    same_len = [(code, conf) for code, conf, _ in all_candidates if len(code) == target_len]
+    if not same_len:
+        return None
+
+    consensus = []
+    for i in range(target_len):
+        char_votes = Counter()
+        for code, conf in same_len:
+            char_votes[code[i]] += conf
+        best_char = char_votes.most_common(1)[0][0]
+        consensus.append(best_char)
+
+    return ''.join(consensus)
+
+
+# ==============================
+# OCR FUNCTIONS
+# ==============================
+
+def run_easyocr(img_gray: np.ndarray, top_crop: bool = True) -> List[Tuple[str, float]]:
+    """Run EasyOCR"""
+    try:
+        h = img_gray.shape[0]
+        img = img_gray[int(h * Config.OCR_TOP_CROP_RATIO):, :] if top_crop else img_gray
+
+        results = reader.readtext(
+            img,
+            allowlist="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-",
+            paragraph=False,
+            detail=1,
+            contrast_ths=0.3,
+            adjust_contrast=0.7,
+            text_threshold=0.6,
+            low_text=0.3,
+            link_threshold=0.3,
+            mag_ratio=1.5,
+            width_ths=0.7,
+        )
+        return [(text, conf) for (_, text, conf) in results]
+    except Exception as e:
+        logger.warning(f"EasyOCR error: {e}")
+        return []
+
+
+def rotate_image(img: np.ndarray, angle: float) -> np.ndarray:
+    h, w = img.shape[:2]
+    center = (w // 2, h // 2)
+    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+    return cv2.warpAffine(img, M, (w, h), borderValue=255)
+
+
+def try_all_ocr(processed_img: np.ndarray) -> List[Tuple[str, float, str]]:
+    """ลอง EasyOCR + rotation — เก็บทุก text ที่อ่านได้"""
+    candidates = []
+
+    images_to_try = [
+        ("", processed_img),
+        ("_rot2", rotate_image(processed_img, 2)),
+        ("_rot-2", rotate_image(processed_img, -2)),
+    ]
+
+    for suffix, img in images_to_try:
+        for text, conf in run_easyocr(img, top_crop=True):
+            result = extract_text_no_pattern(text)
+            if result:
+                clean_text, score = result
+                candidates.append((clean_text, conf * score, f"easyocr_crop{suffix}"))
+
+        for text, conf in run_easyocr(img, top_crop=False):
+            result = extract_text_no_pattern(text)
+            if result:
+                clean_text, score = result
+                candidates.append((clean_text, conf * score, f"easyocr_full{suffix}"))
+
+    return candidates
+
+
+def correct_ocr_format(text: str) -> str:
+    """
+    แก้ปัญหา OCR อ่านผิดทั้งส่วนหัว (ตัวอักษร) และส่วนท้าย (ตัวเลข)
+    อย่างปลอดภัย:
+    - 3 ตัวแรก: ควรเป็นตัวอักษร (แก้ 8->S, 5->S)
+    - ที่เหลือ: ควรเป็นตัวเลข (แก้ O->0, I->1, S->5, Z->2)
+    """
+    if len(text) < 5:
+        return text
+
+    # 0. Fix common multi-character misreads (เช่น H มักโดนอ่านเป็น F1 หรือ FI)
+    text = text.replace('F1', 'H').replace('FI', 'H')
+
+    prefix = text[:3].upper()
+    suffix = text[3:].upper()
+
+    # 1. แก้ส่วนท้าย (Suffix): ส่วนท้ายรหัสครุภัณฑ์ควรเป็นตัวเลข
+    # ถ้ามีตัวอักษรที่หน้าตาคล้ายเลขหลงมา ให้แปลงเป็นเลขให้หมด
+    suffix_fixes = {'O': '0', 'I': '1', 'L': '1', 'S': '5', 'Z': '2', 'B': '8', 'G': '6', 'C': '0', 'Q': '0', 'D': '0'}
+    fixed_suffix = ""
+    for char in suffix:
+        if char in suffix_fixes:
+            fixed_suffix += suffix_fixes[char]
+        else:
+            fixed_suffix += char
+
+    # 2. แก้ส่วนหน้า (Prefix): 3 ตัวแรกควรเป็นอักษร
+    # ถ้าด้านหลังกลายเป็น(หรือเป็น)เลขเกือบหมด -> ข้างหน้าควรแก้เลขเป็นอักษร
+    digits_in_suffix = sum(1 for c in fixed_suffix if c.isdigit())
+    if len(fixed_suffix) > 0 and (digits_in_suffix / len(fixed_suffix)) >= 0.7:
+        prefix_fixes = {'8': 'S', '9': 'S', '5': 'S', '0': 'O', '1': 'I', '2': 'Z'}
+        fixed_prefix = ""
+        for char in prefix:
+            if char in prefix_fixes:
+                fixed_prefix += prefix_fixes[char]
+            else:
+                fixed_prefix += char
+        
+        corrected = fixed_prefix + fixed_suffix
+        if corrected != text:
+             logger.info(f"🔧 OCR Fix: '{text}' → '{corrected}'")
+        return corrected
+
+    # ถ้าเงื่อนไขไม่ตรง ก็ส่งส่วนท้ายที่แก้แล้วประกบกลับ
+    corrected = prefix + fixed_suffix
+    if corrected != text:
+         logger.info(f"🔧 OCR Suffix Fix: '{text}' → '{corrected}'")
+    
+    return corrected
+
+
+def pick_best_candidate(all_candidates: List[Tuple[str, float, str]]) -> Optional[Tuple[str, float, str]]:
+    """
+    เลือก text ที่ดีที่สุดจาก candidates ทั้งหมด
+    
+    ใช้ VOTE-FIRST strategy:
+    1. นับ votes ของแต่ละ text
+    2. เลือก text ที่ votes มากที่สุด
+    3. ส่งผ่าน correct_ocr_format เพื่อแก้ให้ถูกต้องที่สุด
+    """
+    if not all_candidates:
+        return None
+
+    text_info = defaultdict(lambda: {"count": 0, "best_conf": 0.0, "best_engine": ""})
+    for text, conf, engine in all_candidates:
+        info = text_info[text]
+        info["count"] += 1
+        if conf > info["best_conf"]:
+            info["best_conf"] = conf
+            info["best_engine"] = engine
+
+    sorted_texts = sorted(
+        text_info.items(),
+        key=lambda x: (x[1]["count"], x[1]["best_conf"]),
+        reverse=True
+    )
+
+    best_text = sorted_texts[0][0]
+    best_info = sorted_texts[0][1]
+
+    # แก้ไขทั้ง Prefix และ Suffix ให้ตรงกับฟอร์แมตครุภัณฑ์ (เช่น 89HO3558 -> SSH03558)
+    final_text = correct_ocr_format(best_text)
+
+    total = len(all_candidates)
+    logger.info(
+        f"📊 Voting: top5={[(t, i['count']) for t, i in sorted_texts[:5]]} "
+        f"→ raw='{best_text}' → final='{final_text}' (votes={best_info['count']}/{total}, conf={best_info['best_conf']:.3f})"
+    )
+
+    return final_text, best_info["best_conf"], best_info["best_engine"]
+
+
+# ==============================
+# MAIN DETECTION PIPELINE (EXTREME SPEED)
+# ==============================
+
+def detect_code(img: np.ndarray) -> Tuple[Dict, Dict[str, np.ndarray]]:
+    """ตรวจจับและอ่านรหัสจากภาพ โดยเน้นความเร็วสูงสุด"""
+    start = time.time()
+    detected = False
+    images_to_save = {"original.jpg": img.copy()}
+
+    # ลดขนาดการวิเคราะห์ YOLO ให้เร็วขึ้น ลด confลงเล็กน้อยเผื่อป้ายไม่ชัด
+    results = model.predict(
+        source=img,
+        conf=0.25, 
+        imgsz=Config.YOLO_IMGSZ,
+        verbose=False,
+        max_det=1, # เอาแค่ป้ายเดียวที่ชัดที่สุด
+        device=0,
+        half=True
+    )
+
+    # ใช้แค่ 3 Strategy ที่เร็วที่สุด
+    FAST_STRATEGIES = ["v1_clahe", "v3_otsu", "v2_adaptive"]
+    
+    for r in results:
+        if not r.boxes:
+            continue
+        detected = True
+
+        for box in sorted(r.boxes, key=lambda x: x.conf[0], reverse=True)[:1]: # ดูแค่กล่องเดียวที่มั่นใจสุด
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+
+            pad_x = int((x2 - x1) * 0.10)
+            pad_y = int((y2 - y1) * 0.10)
+            x1 = max(0, x1 - pad_x)
+            y1 = max(0, y1 - pad_y)
+            x2 = min(img.shape[1], x2 + pad_x)
+            y2 = min(img.shape[0], y2 + pad_y)
+
+            crop = img[y1:y2, x1:x2]
+            if not validate_image(crop):
+                continue
+
+            img_with_box = img.copy()
+            cv2.rectangle(img_with_box, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(img_with_box, f"YOLO: {box.conf[0]:.2f}", (x1, max(0, y1-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+            images_to_save["yolo_detect.jpg"] = img_with_box
+            images_to_save["yolo_crop.jpg"] = crop.copy()
+
+            logger.info(f"🔍 Trying crop size: {crop.shape} | yolo_conf: {box.conf[0]:.2f}")
+
+            all_candidates = []
+            strategy_dict = dict(ALL_PREPROCESS_STRATEGIES)
+
+            # --- EXTREME FAST PATH ---
+            best_conf = 0.0
+            
+            for strategy_name in FAST_STRATEGIES:
+                processed = strategy_dict[strategy_name](crop)
+                if processed is None:
+                    continue
+                images_to_save[f"preprocessed_{strategy_name}.jpg"] = processed.copy()
+
+                # ไม่ทำ rotation, ไม่ทำ top_crop (ทำแค่เต็มใบ 1 ครั้งต่อฟิลเตอร์)
+                for text, conf in run_easyocr(processed, top_crop=False):
+                    result = extract_text_no_pattern(text)
+                    if result:
+                        clean_text, score = result
+                        final_conf = conf * score
+                        
+                        all_candidates.append((clean_text, final_conf, f"easyocr_fast+{strategy_name}"))
+                        
+                        if final_conf > best_conf:
+                            best_conf = final_conf
+
+                # ถ้าเจอความมั่นใจเกิน 70% ตอบเลย (ไม่ต้องเสียเวลารัน filter อื่น)
+                if all_candidates and best_conf >= 0.70:
+                    break
+
+            # เลือกอันที่ดีที่สุดจากรอบที่เร็วที่สุด
+            if all_candidates:
+                best = pick_best_candidate(all_candidates)
+                if best:
+                    text, confidence, engine = best
+                    if confidence >= 0.70:
+                        elapsed = time.time() - start
+                        logger.info(f"⚡ FAST SUCCESS | text={text} | engine={engine} | time={elapsed:.2f}s")
+                        return {
+                            "status": "success",
+                            "message": "Detect และ OCR สำเร็จ (Fast Path)",
+                            "code": text,
+                            "source": engine,
+                            "confidence": float(box.conf[0]),
+                            "ocr_confidence": round(confidence, 3),
+                            "total_candidates": len(all_candidates),
+                            "processing_time": f"{elapsed:.2f}s"
+                        }, images_to_save
+                    else:
+                        logger.warning(f"⚠️ Best OCR conf {confidence:.3f} < 0.70, rejected text '{text}'")
+
+            logger.warning("⚠️ All fast strategies failed or conf < 0.70 for this box")
+
+    if detected:
+        return {
+            "status": "detected_no_ocr",
+            "message": "Detect เจอป้าย แต่ OCR อ่านข้อความไม่ได้เลย",
+            "processing_time": f"{time.time() - start:.2f}s"
+        }, images_to_save
+
+    return {
+        "status": "not_detected",
+        "message": "YOLO ไม่พบป้าย",
+        "processing_time": f"{time.time() - start:.2f}s"
+    }, images_to_save
+
+
+# ==============================
+# SAVE JSON
+# ==============================
+
+def save_run_results(result: Dict, images_to_save: Dict[str, np.ndarray]):
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    status = result.get("status", "unknown")
+    code = result.get("code", "NO_CODE")
+    
+    folder_name = f"{timestamp}_{status}_{code}"
+    run_dir = os.path.join(Config.OUTPUT_RUNS_DIR, folder_name)
+    os.makedirs(run_dir, exist_ok=True)
+    
+    json_path = os.path.join(run_dir, "result.json")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
+        
+    for filename, img_data in images_to_save.items():
+        img_path = os.path.join(run_dir, filename)
+        cv2.imwrite(img_path, img_data)
+        
+    logger.info(f"📁 Saved full run results to: {run_dir}")
+
+
+# ==============================
+# API
+# ==============================
+
+@app.route("/ocr", methods=["POST"])
+def ocr_image():
+    if "file" not in request.files:
+        return jsonify({"status": "error", "message": "No file uploaded"}), 400
+
+    img = cv2.imdecode(
+        np.frombuffer(request.files["file"].read(), np.uint8),
+        cv2.IMREAD_COLOR
+    )
+    if not validate_image(img):
+        return jsonify({"status": "error", "message": "Invalid image"}), 400
+
+    result, images_to_save = detect_code(img)
+    save_run_results(result, images_to_save)
+    return jsonify(result)
+
+
+# ==============================
+# DEBUG ENDPOINT
+# ==============================
+
+@app.route("/debug", methods=["POST"])
+def debug_image():
+    if "file" not in request.files:
+        return jsonify({"status": "error", "message": "No file uploaded"}), 400
+
+    img = cv2.imdecode(
+        np.frombuffer(request.files["file"].read(), np.uint8),
+        cv2.IMREAD_COLOR
+    )
+    if not validate_image(img):
+        return jsonify({"status": "error", "message": "Invalid image"}), 400
+
+    debug_results = []
+    for strategy_name, preprocess_fn in ALL_PREPROCESS_STRATEGIES:
+        processed = preprocess_fn(img)
+        if processed is None:
+            debug_results.append({"strategy": strategy_name, "result": "preprocess_failed"})
+            continue
+
+        all_texts = [(t, c, "easyocr") for t, c in run_easyocr(processed, top_crop=False)]
+        found_list = []
+        for text, conf, engine in all_texts:
+            result = extract_text_no_pattern(text)
+            if result:
+                found_list.append({"text": result[0], "score": result[1], "engine": engine, "raw_text": text})
+
+        debug_results.append({
+            "strategy": strategy_name,
+            "raw_texts": [(t, round(c, 3)) for t, c, _ in all_texts[:10]],
+            "found": found_list
+        })
+
+    return jsonify({"debug": debug_results})
+
+
+# ==============================
+# RUN
+# ==============================
+
+if __name__ == "__main__":
+    logger.info(f"🚀 Starting OCR API (No Pattern) on port {Config.PORT}")
+    app.run(host="0.0.0.0", port=Config.PORT, debug=False)
