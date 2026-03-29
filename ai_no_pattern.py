@@ -22,10 +22,9 @@ logger = logging.getLogger(__name__)
 
 
 class Config:
-    MODEL_PATH = "D:/New folder/Model/train_20260318_024752/weights/best.pt"
+    MODEL_PATH = "D:/gog/AI_ocr/model/V11n/weights/best.pt"
     PORT = 8000
-    OUTPUT_JSON_DIR = "json_results"
-    OUTPUT_RUNS_DIR = "ocr_runs"
+
     YOLO_CONF = 0.1
     YOLO_IMGSZ = 640
     RESIZE_SCALE = 2.0
@@ -40,8 +39,7 @@ class Config:
     }
 
 
-os.makedirs(Config.OUTPUT_JSON_DIR, exist_ok=True)
-os.makedirs(Config.OUTPUT_RUNS_DIR, exist_ok=True)
+
 model = YOLO(Config.MODEL_PATH)
 reader = easyocr.Reader(['en'], gpu=True, verbose=False)
 app = Flask(__name__)
@@ -512,11 +510,11 @@ def pick_best_candidate(all_candidates: List[Tuple[str, float, str]]) -> Optiona
 # MAIN DETECTION PIPELINE (EXTREME SPEED)
 # ==============================
 
-def detect_code(img: np.ndarray) -> Tuple[Dict, Dict[str, np.ndarray]]:
+def detect_code(img: np.ndarray) -> Dict:
     """ตรวจจับและอ่านรหัสจากภาพ โดยเน้นความเร็วสูงสุด"""
     start = time.time()
     detected = False
-    images_to_save = {"original.jpg": img.copy()}
+
 
     # ลดขนาดการวิเคราะห์ YOLO ให้เร็วขึ้น ลด confลงเล็กน้อยเผื่อป้ายไม่ชัด
     results = model.predict(
@@ -551,11 +549,6 @@ def detect_code(img: np.ndarray) -> Tuple[Dict, Dict[str, np.ndarray]]:
             if not validate_image(crop):
                 continue
 
-            img_with_box = img.copy()
-            cv2.rectangle(img_with_box, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(img_with_box, f"YOLO: {box.conf[0]:.2f}", (x1, max(0, y1-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
-            images_to_save["yolo_detect.jpg"] = img_with_box
-            images_to_save["yolo_crop.jpg"] = crop.copy()
 
             logger.info(f"🔍 Trying crop size: {crop.shape} | yolo_conf: {box.conf[0]:.2f}")
 
@@ -569,7 +562,7 @@ def detect_code(img: np.ndarray) -> Tuple[Dict, Dict[str, np.ndarray]]:
                 processed = strategy_dict[strategy_name](crop)
                 if processed is None:
                     continue
-                images_to_save[f"preprocessed_{strategy_name}.jpg"] = processed.copy()
+
 
                 # ไม่ทำ rotation, ไม่ทำ top_crop (ทำแค่เต็มใบ 1 ครั้งต่อฟิลเตอร์)
                 for text, conf in run_easyocr(processed, top_crop=False):
@@ -583,8 +576,8 @@ def detect_code(img: np.ndarray) -> Tuple[Dict, Dict[str, np.ndarray]]:
                         if final_conf > best_conf:
                             best_conf = final_conf
 
-                # ถ้าเจอความมั่นใจเกิน 70% ตอบเลย (ไม่ต้องเสียเวลารัน filter อื่น)
-                if all_candidates and best_conf >= 0.70:
+                # ถ้าเจอความมั่นใจเกิน 45% ตอบเลย (ไม่ต้องเสียเวลารัน filter อื่น)
+                if all_candidates and best_conf >= 0.45:
                     break
 
             # เลือกอันที่ดีที่สุดจากรอบที่เร็วที่สุด
@@ -592,7 +585,7 @@ def detect_code(img: np.ndarray) -> Tuple[Dict, Dict[str, np.ndarray]]:
                 best = pick_best_candidate(all_candidates)
                 if best:
                     text, confidence, engine = best
-                    if confidence >= 0.70:
+                    if confidence >= 0.40:
                         elapsed = time.time() - start
                         logger.info(f"⚡ FAST SUCCESS | text={text} | engine={engine} | time={elapsed:.2f}s")
                         return {
@@ -604,9 +597,9 @@ def detect_code(img: np.ndarray) -> Tuple[Dict, Dict[str, np.ndarray]]:
                             "ocr_confidence": round(confidence, 3),
                             "total_candidates": len(all_candidates),
                             "processing_time": f"{elapsed:.2f}s"
-                        }, images_to_save
+                        }
                     else:
-                        logger.warning(f"⚠️ Best OCR conf {confidence:.3f} < 0.70, rejected text '{text}'")
+                        logger.warning(f"⚠️ Best OCR conf {confidence:.3f} < 0.40, rejected text '{text}'")
 
             logger.warning("⚠️ All fast strategies failed or conf < 0.70 for this box")
 
@@ -615,37 +608,16 @@ def detect_code(img: np.ndarray) -> Tuple[Dict, Dict[str, np.ndarray]]:
             "status": "detected_no_ocr",
             "message": "Detect เจอป้าย แต่ OCR อ่านข้อความไม่ได้เลย",
             "processing_time": f"{time.time() - start:.2f}s"
-        }, images_to_save
+        }
 
     return {
         "status": "not_detected",
         "message": "YOLO ไม่พบป้าย",
         "processing_time": f"{time.time() - start:.2f}s"
-    }, images_to_save
+    }
 
 
-# ==============================
-# SAVE JSON
-# ==============================
 
-def save_run_results(result: Dict, images_to_save: Dict[str, np.ndarray]):
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    status = result.get("status", "unknown")
-    code = result.get("code", "NO_CODE")
-    
-    folder_name = f"{timestamp}_{status}_{code}"
-    run_dir = os.path.join(Config.OUTPUT_RUNS_DIR, folder_name)
-    os.makedirs(run_dir, exist_ok=True)
-    
-    json_path = os.path.join(run_dir, "result.json")
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
-        
-    for filename, img_data in images_to_save.items():
-        img_path = os.path.join(run_dir, filename)
-        cv2.imwrite(img_path, img_data)
-        
-    logger.info(f"📁 Saved full run results to: {run_dir}")
 
 
 # ==============================
@@ -664,8 +636,7 @@ def ocr_image():
     if not validate_image(img):
         return jsonify({"status": "error", "message": "Invalid image"}), 400
 
-    result, images_to_save = detect_code(img)
-    save_run_results(result, images_to_save)
+    result = detect_code(img)
     return jsonify(result)
 
 
