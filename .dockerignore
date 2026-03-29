@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+json_results/
+tesseract-ocr.exe
+.env
+.git
+ai.py
+aimuti.py
+aiocr.py
+V11Last.pt
+model/best_v8.pt

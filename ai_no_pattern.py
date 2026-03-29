@@ -22,8 +22,8 @@ logger = logging.getLogger(__name__)
 
 
 class Config:
-    MODEL_PATH = "D:/gog/AI_ocr/model/V11n/weights/best.pt"
-    PORT = 8000
+    MODEL_PATH = os.getenv("MODEL_PATH", "model/V11n/weights/best.pt")
+    PORT = int(os.getenv("PORT", "8000"))
 
     YOLO_CONF = 0.1
     YOLO_IMGSZ = 640
@@ -41,7 +41,8 @@ class Config:
 
 
 model = YOLO(Config.MODEL_PATH)
-reader = easyocr.Reader(['en'], gpu=True, verbose=False)
+GPU_ENABLED = os.getenv("GPU_ENABLED", "false").lower() == "true"
+reader = easyocr.Reader(['en'], gpu=GPU_ENABLED, verbose=False)
 app = Flask(__name__)
 
 
@@ -523,8 +524,8 @@ def detect_code(img: np.ndarray) -> Dict:
         imgsz=Config.YOLO_IMGSZ,
         verbose=False,
         max_det=1, # เอาแค่ป้ายเดียวที่ชัดที่สุด
-        device=0,
-        half=True
+        device="cpu",
+        half=False
     )
 
     # ใช้แค่ 3 Strategy ที่เร็วที่สุด
