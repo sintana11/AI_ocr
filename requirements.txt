@@ -1,5 +1,5 @@
-flask
-ultralytics
-easyocr
-opencv-python-headless
-numpy
+flask>=3.0
+ultralytics>=8.0
+easyocr>=1.7
+opencv-python-headless>=4.8
+numpy>=1.24

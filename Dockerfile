@@ -1,20 +1,30 @@
-# ── Stage: Runtime ──────────────────────────────────────────
-FROM python:3.11-slim
+FROM python:3.10-slim
+
+# ติดตั้ง system dependencies สำหรับ OpenCV
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgl1 \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# System deps for OpenCV headless
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgl1 libglib2.0-0 \
-    && rm -rf /var/lib/apt/lists/*
-
-# Python deps (cached layer)
+# ติดตั้ง Python dependencies (แยก layer เพื่อ cache)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy app + model
+# คัดลอก model
+COPY model/ /app/model/
+
+# คัดลอก application code
 COPY ai_no_pattern.py .
-COPY model/V11n/weights/best.pt model/V11n/weights/best.pt
+
+# ตั้งค่า environment variables
+ENV MODEL_PATH=/app/model/V11n/weights/best.pt
+ENV PORT=8000
+ENV PYTHONUNBUFFERED=1
 
 EXPOSE 8000
 

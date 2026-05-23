@@ -1,0 +1,29 @@
+services:
+  ocr:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: medical-ai-ocr
+    container_name: ocr
+    ports:
+      - "8000:8000"
+    environment:
+      - MODEL_PATH=/app/model/V11n/weights/best.pt
+      - PORT=8000
+      - EASYOCR_GPU=false
+    volumes:
+      - ./model:/app/model:ro
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "1.5"
+        reservations:
+          memory: 512M
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s

@@ -10,6 +10,7 @@ from typing import Optional, Dict, List, Tuple
 import time
 import json
 import os
+import gc
 
 # ==============================
 # LOGGING SETUP
@@ -27,11 +28,12 @@ class Config:
 
     YOLO_CONF = 0.1
     YOLO_IMGSZ = 640
-    RESIZE_SCALE = 2.0
     DENOISE_H = 20
     ADAPTIVE_THRESH_BLOCK = 31
     ADAPTIVE_THRESH_C = 10
     OCR_TOP_CROP_RATIO = 0.45
+    MIN_OCR_DIM = 300
+    MAX_INPUT_SIZE = 1280
     LABEL_NOISE_WORDS = {
         "HEALTH", "BIOMEDICAL", "ENGINEERING", "SERVICE", "MEDIUM",
         "RISK", "DEVICE", "CALIBRATION", "DATE", "MODEL", "SERIAL",
@@ -44,6 +46,29 @@ model = YOLO(Config.MODEL_PATH)
 GPU_ENABLED = os.getenv("GPU_ENABLED", "false").lower() == "true"
 reader = easyocr.Reader(['en'], gpu=GPU_ENABLED, verbose=False)
 app = Flask(__name__)
+
+
+def limit_image_size(img: np.ndarray, max_size: int = None) -> np.ndarray:
+    """ย่อภาพถ้าด้านยาวสุดเกิน max_size — ลด RAM ทั้ง pipeline"""
+    if max_size is None:
+        max_size = Config.MAX_INPUT_SIZE
+    h, w = img.shape[:2]
+    if max(h, w) <= max_size:
+        return img
+    scale = max_size / max(h, w)
+    new_w, new_h = int(w * scale), int(h * scale)
+    logger.info(f"Resize input: {w}x{h} -> {new_w}x{new_h} (save RAM)")
+    return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+
+def compute_resize_scale(crop: np.ndarray) -> float:
+    """คำนวณ scale อัตโนมัติตามขนาด crop — crop เล็กขยายมาก, crop ใหญ่ขยายน้อย"""
+    min_dim = min(crop.shape[0], crop.shape[1])
+    if min_dim >= Config.MIN_OCR_DIM:
+        return 1.0  # ใหญ่พอแล้ว ไม่ต้องขยาย
+    scale = Config.MIN_OCR_DIM / min_dim
+    scale = min(scale, 4.0)  # จำกัดไม่เกิน 4x เพื่อไม่กิน RAM เกิน
+    return round(scale, 2)
 
 
 # ==============================
@@ -60,15 +85,16 @@ def validate_image(img: np.ndarray) -> bool:
 
 
 # ==============================
-# PREPROCESSING STRATEGIES
+# PREPROCESSING STRATEGIES (ใช้ adaptive resize)
 # ==============================
 
 def preprocess_v1_clahe(img: np.ndarray) -> Optional[np.ndarray]:
-    """Strategy 1: CLAHE (original approach, fast)"""
+    """Strategy 1: CLAHE (fast, good contrast)"""
     try:
-        img = cv2.resize(img, None, fx=Config.RESIZE_SCALE, fy=Config.RESIZE_SCALE,
-                         interpolation=cv2.INTER_LINEAR)
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        scale = compute_resize_scale(img)
+        if scale > 1.0:
+            img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
         clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
         return clahe.apply(gray)
     except Exception as e:
@@ -78,10 +104,11 @@ def preprocess_v1_clahe(img: np.ndarray) -> Optional[np.ndarray]:
 
 def preprocess_v2_adaptive_thresh(img: np.ndarray) -> Optional[np.ndarray]:
     try:
-        img = cv2.resize(img, None, fx=Config.RESIZE_SCALE, fy=Config.RESIZE_SCALE,
-                         interpolation=cv2.INTER_CUBIC)
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        gray = cv2.fastNlMeansDenoising(gray, h=15)
+        scale = compute_resize_scale(img)
+        if scale > 1.0:
+            img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
         thresh = cv2.adaptiveThreshold(
             gray, 255,
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
@@ -97,9 +124,10 @@ def preprocess_v2_adaptive_thresh(img: np.ndarray) -> Optional[np.ndarray]:
 
 def preprocess_v3_otsu(img: np.ndarray) -> Optional[np.ndarray]:
     try:
-        img = cv2.resize(img, None, fx=Config.RESIZE_SCALE, fy=Config.RESIZE_SCALE,
-                         interpolation=cv2.INTER_CUBIC)
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        scale = compute_resize_scale(img)
+        if scale > 1.0:
+            img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
         gray = cv2.GaussianBlur(gray, (3, 3), 0)
         _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         return thresh
@@ -373,7 +401,7 @@ def run_easyocr(img_gray: np.ndarray, top_crop: bool = True) -> List[Tuple[str, 
             text_threshold=0.6,
             low_text=0.3,
             link_threshold=0.3,
-            mag_ratio=1.5,
+            mag_ratio=1.0,  # ลดจาก 1.5 — ภาพถูก resize 2x แล้ว ไม่ต้องขยายซ้ำ
             width_ths=0.7,
         )
         return [(text, conf) for (_, text, conf) in results]
@@ -508,101 +536,130 @@ def pick_best_candidate(all_candidates: List[Tuple[str, float, str]]) -> Optiona
 
 
 # ==============================
-# MAIN DETECTION PIPELINE (EXTREME SPEED)
+# MAIN DETECTION PIPELINE
 # ==============================
 
 def detect_code(img: np.ndarray) -> Dict:
-    """ตรวจจับและอ่านรหัสจากภาพ โดยเน้นความเร็วสูงสุด"""
+    """ตรวจจับและอ่านรหัสจากภาพ — adaptive resize + ประหยัดทรัพยากร"""
     start = time.time()
     detected = False
 
+    # จำกัดขนาดภาพอินพุตเพื่อลด RAM ตลอด pipeline
+    img = limit_image_size(img)
 
-    # ลดขนาดการวิเคราะห์ YOLO ให้เร็วขึ้น ลด confลงเล็กน้อยเผื่อป้ายไม่ชัด
+    # YOLO detect
     results = model.predict(
         source=img,
-        conf=0.25, 
+        conf=0.25,
         imgsz=Config.YOLO_IMGSZ,
         verbose=False,
-        max_det=1, # เอาแค่ป้ายเดียวที่ชัดที่สุด
-        device="cpu",
+        max_det=1,
+        device='cpu',
         half=False
     )
 
-    # ใช้แค่ 3 Strategy ที่เร็วที่สุด
-    FAST_STRATEGIES = ["v1_clahe", "v3_otsu", "v2_adaptive"]
-    
+    # ดึง boxes ออกมาแล้วปล่อย YOLO results เพื่อคืน memory
+    boxes_data = []
     for r in results:
-        if not r.boxes:
+        if r.boxes:
+            detected = True
+            for box in sorted(r.boxes, key=lambda x: x.conf[0], reverse=True)[:1]:
+                boxes_data.append({
+                    'xyxy': list(map(int, box.xyxy[0])),
+                    'conf': float(box.conf[0])
+                })
+    del results
+
+    FAST_STRATEGIES = ["v1_clahe", "v3_otsu", "v2_adaptive"]
+    strategy_dict = dict(ALL_PREPROCESS_STRATEGIES)
+
+    for box_info in boxes_data:
+        x1, y1, x2, y2 = box_info['xyxy']
+        box_conf = box_info['conf']
+
+        # เพิ่ม padding 20% (จากเดิม 10%) เพื่อให้ OCR มี context มากขึ้น
+        pad_x = int((x2 - x1) * 0.20)
+        pad_y = int((y2 - y1) * 0.20)
+        x1 = max(0, x1 - pad_x)
+        y1 = max(0, y1 - pad_y)
+        x2 = min(img.shape[1], x2 + pad_x)
+        y2 = min(img.shape[0], y2 + pad_y)
+
+        crop = img[y1:y2, x1:x2].copy()
+        if not validate_image(crop):
             continue
-        detected = True
 
-        for box in sorted(r.boxes, key=lambda x: x.conf[0], reverse=True)[:1]: # ดูแค่กล่องเดียวที่มั่นใจสุด
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
+        adaptive_scale = compute_resize_scale(crop)
+        logger.info(f"🔍 crop: {crop.shape} | yolo_conf: {box_conf:.2f} | adaptive_scale: {adaptive_scale}x")
 
-            pad_x = int((x2 - x1) * 0.10)
-            pad_y = int((y2 - y1) * 0.10)
-            x1 = max(0, x1 - pad_x)
-            y1 = max(0, y1 - pad_y)
-            x2 = min(img.shape[1], x2 + pad_x)
-            y2 = min(img.shape[0], y2 + pad_y)
+        all_candidates = []
+        best_conf = 0.0
 
-            crop = img[y1:y2, x1:x2]
-            if not validate_image(crop):
+        # === PASS 1: full image (ไม่ crop top) ===
+        for strategy_name in FAST_STRATEGIES:
+            processed = strategy_dict[strategy_name](crop)
+            if processed is None:
                 continue
 
+            for text, conf in run_easyocr(processed, top_crop=False):
+                result = extract_text_no_pattern(text)
+                if result:
+                    clean_text, score = result
+                    final_conf = conf * score
+                    all_candidates.append((clean_text, final_conf, f"easyocr_full+{strategy_name}"))
+                    if final_conf > best_conf:
+                        best_conf = final_conf
 
-            logger.info(f"🔍 Trying crop size: {crop.shape} | yolo_conf: {box.conf[0]:.2f}")
+            del processed
 
-            all_candidates = []
-            strategy_dict = dict(ALL_PREPROCESS_STRATEGIES)
+            if all_candidates and best_conf >= 0.35:
+                break
 
-            # --- EXTREME FAST PATH ---
-            best_conf = 0.0
-            
-            for strategy_name in FAST_STRATEGIES:
+        # === PASS 2: ถ้ายังไม่เจอ ลอง top_crop (ตัดครึ่งบน ดูแค่ส่วนล่างที่มีรหัส) ===
+        if not all_candidates or best_conf < 0.25:
+            for strategy_name in FAST_STRATEGIES[:2]:  # ลองแค่ 2 strategy
                 processed = strategy_dict[strategy_name](crop)
                 if processed is None:
                     continue
 
-
-                # ไม่ทำ rotation, ไม่ทำ top_crop (ทำแค่เต็มใบ 1 ครั้งต่อฟิลเตอร์)
-                for text, conf in run_easyocr(processed, top_crop=False):
+                for text, conf in run_easyocr(processed, top_crop=True):
                     result = extract_text_no_pattern(text)
                     if result:
                         clean_text, score = result
                         final_conf = conf * score
-                        
-                        all_candidates.append((clean_text, final_conf, f"easyocr_fast+{strategy_name}"))
-                        
+                        all_candidates.append((clean_text, final_conf, f"easyocr_crop+{strategy_name}"))
                         if final_conf > best_conf:
                             best_conf = final_conf
 
-                # ถ้าเจอความมั่นใจเกิน 45% ตอบเลย (ไม่ต้องเสียเวลารัน filter อื่น)
-                if all_candidates and best_conf >= 0.45:
+                del processed
+
+                if all_candidates and best_conf >= 0.35:
                     break
 
-            # เลือกอันที่ดีที่สุดจากรอบที่เร็วที่สุด
-            if all_candidates:
-                best = pick_best_candidate(all_candidates)
-                if best:
-                    text, confidence, engine = best
-                    if confidence >= 0.40:
-                        elapsed = time.time() - start
-                        logger.info(f"⚡ FAST SUCCESS | text={text} | engine={engine} | time={elapsed:.2f}s")
-                        return {
-                            "status": "success",
-                            "message": "Detect และ OCR สำเร็จ (Fast Path)",
-                            "code": text,
-                            "source": engine,
-                            "confidence": float(box.conf[0]),
-                            "ocr_confidence": round(confidence, 3),
-                            "total_candidates": len(all_candidates),
-                            "processing_time": f"{elapsed:.2f}s"
-                        }
-                    else:
-                        logger.warning(f"⚠️ Best OCR conf {confidence:.3f} < 0.40, rejected text '{text}'")
+        del crop
 
-            logger.warning("⚠️ All fast strategies failed or conf < 0.70 for this box")
+        # เลือกผลลัพธ์ที่ดีที่สุด
+        if all_candidates:
+            best = pick_best_candidate(all_candidates)
+            if best:
+                text, confidence, engine = best
+                if confidence >= 0.20:
+                    elapsed = time.time() - start
+                    logger.info(f"⚡ SUCCESS | text={text} | conf={confidence:.3f} | engine={engine} | time={elapsed:.2f}s")
+                    return {
+                        "status": "success",
+                        "message": "Detect และ OCR สำเร็จ",
+                        "code": text,
+                        "source": engine,
+                        "confidence": box_conf,
+                        "ocr_confidence": round(confidence, 3),
+                        "total_candidates": len(all_candidates),
+                        "processing_time": f"{elapsed:.2f}s"
+                    }
+                else:
+                    logger.warning(f"⚠️ OCR conf {confidence:.3f} < 0.20, rejected '{text}'")
+
+        logger.warning("⚠️ All strategies failed for this box")
 
     if detected:
         return {
@@ -638,6 +695,8 @@ def ocr_image():
         return jsonify({"status": "error", "message": "Invalid image"}), 400
 
     result = detect_code(img)
+    del img  # ปล่อยภาพต้นฉบับคืน RAM
+    gc.collect()  # บังคับคืน memory ทันที
     return jsonify(result)
 
 
