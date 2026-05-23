@@ -43,7 +43,7 @@ class Config:
 
 
 model = YOLO(Config.MODEL_PATH)
-GPU_ENABLED = os.getenv("GPU_ENABLED", "false").lower() == "true"
+GPU_ENABLED = os.getenv("EASYOCR_GPU", os.getenv("GPU_ENABLED", "false")).lower() == "true"
 reader = easyocr.Reader(['en'], gpu=GPU_ENABLED, verbose=False)
 app = Flask(__name__)
 
@@ -138,9 +138,10 @@ def preprocess_v3_otsu(img: np.ndarray) -> Optional[np.ndarray]:
 
 def preprocess_v4_sharpened(img: np.ndarray) -> Optional[np.ndarray]:
     try:
-        img = cv2.resize(img, None, fx=Config.RESIZE_SCALE * 1.5, fy=Config.RESIZE_SCALE * 1.5,
-                         interpolation=cv2.INTER_CUBIC)
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        scale = compute_resize_scale(img)
+        if scale > 1.0:
+            img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
         blurred = cv2.GaussianBlur(gray, (5, 5), 1.0)
         sharpened = cv2.addWeighted(gray, 1.8, blurred, -0.8, 0)
         clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
@@ -152,9 +153,10 @@ def preprocess_v4_sharpened(img: np.ndarray) -> Optional[np.ndarray]:
 
 def preprocess_v5_inverted(img: np.ndarray) -> Optional[np.ndarray]:
     try:
-        img = cv2.resize(img, None, fx=Config.RESIZE_SCALE, fy=Config.RESIZE_SCALE,
-                         interpolation=cv2.INTER_LINEAR)
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        scale = compute_resize_scale(img)
+        if scale > 1.0:
+            img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
         inverted = cv2.bitwise_not(gray)
         clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
         return clahe.apply(inverted)
@@ -165,9 +167,10 @@ def preprocess_v5_inverted(img: np.ndarray) -> Optional[np.ndarray]:
 
 def preprocess_v6_morph(img: np.ndarray) -> Optional[np.ndarray]:
     try:
-        img = cv2.resize(img, None, fx=Config.RESIZE_SCALE, fy=Config.RESIZE_SCALE,
-                         interpolation=cv2.INTER_CUBIC)
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        scale = compute_resize_scale(img)
+        if scale > 1.0:
+            img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
         gray = cv2.dilate(gray, kernel, iterations=1)
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
@@ -742,6 +745,11 @@ def debug_image():
 # ==============================
 # RUN
 # ==============================
+
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok"})
+
 
 if __name__ == "__main__":
     logger.info(f"🚀 Starting OCR API (No Pattern) on port {Config.PORT}")
