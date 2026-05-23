@@ -23,9 +23,10 @@ logger = logging.getLogger(__name__)
 
 
 class Config:
-    MODEL_PATH = os.environ.get("MODEL_PATH", "D:/gog/AI_ocr/model/V11n/weights/best.pt")
-    PORT = int(os.environ.get("PORT", 8000))
-    YOLO_CONF = 0.25
+    MODEL_PATH = os.getenv("MODEL_PATH", "model/V11n/weights/best.pt")
+    PORT = int(os.getenv("PORT", "8000"))
+
+    YOLO_CONF = 0.1
     YOLO_IMGSZ = 640
     DENOISE_H = 20
     ADAPTIVE_THRESH_BLOCK = 31
@@ -42,9 +43,8 @@ class Config:
 
 
 model = YOLO(Config.MODEL_PATH)
-# ถ้ารันใน Docker (CPU-only) ให้ตั้ง EASYOCR_GPU=false
-_use_gpu = os.environ.get("EASYOCR_GPU", "true").lower() == "true"
-reader = easyocr.Reader(['en'], gpu=_use_gpu, verbose=False)
+GPU_ENABLED = os.getenv("GPU_ENABLED", "false").lower() == "true"
+reader = easyocr.Reader(['en'], gpu=GPU_ENABLED, verbose=False)
 app = Flask(__name__)
 
 
