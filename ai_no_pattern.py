@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 
 class Config:
-    MODEL_PATH = os.getenv("MODEL_PATH", "model/V11n/weights/best.pt")
+    MODEL_PATH = os.getenv("MODEL_PATH", "D:\\gog\\AI_ocr\\model\\V11n\\weights\\best.pt")
     PORT = int(os.getenv("PORT", "8000"))
 
     YOLO_CONF = 0.1
